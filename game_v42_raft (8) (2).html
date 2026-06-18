@@ -3519,6 +3519,10 @@ const RAFT_TILT_DECAY=0.88;   // angular velocity damping
 const RAFT_SINK_SPEED=2.2;    // m/s sink rate when overloaded
 const RAFT_MAX_TILT=0.44;     // max lean in radians
 const RAFT_WATER_DRAG=0.022;  // quadratic drag coefficient
+const RAFT_FLUID_DRAG=1.6;    // vertical damping while raft is submerged
+const RAFT_WAVE_TORQUE=0.15;  // how much wave height differences tilt the raft
+const RAFT_MAX_VERTICAL_SPEED=3.2;
+const RAFT_WAVE_SAMPLE_GRID=3; // 3x3 AABB wave sampling for raft flotation
 const RAFT_TURN=1.6,RAFT_ACCEL=4.2,RAFT_MAX_SPEED=5.5;
 const RAFT_MIN_BLOCKS=1;      // 1 glued block is enough to start
 
@@ -3536,6 +3540,37 @@ function raftWaterSurface(x,z){
 
 function _subVol(raft,d){let v=0;for(const h of raft.columns.values())v+=Math.max(0,Math.min(d,h));return v;}
 
+function _raftWaveInfo(raft){
+  const grid=RAFT_WAVE_SAMPLE_GRID;
+  const stepX = Math.max(0, (raft.maxX - raft.minX) / Math.max(1, grid - 1));
+  const stepZ = Math.max(0, (raft.maxZ - raft.minZ) / Math.max(1, grid - 1));
+  let sum=0, count=0;
+  let leftSum=0,rightSum=0,leftCount=0,rightCount=0;
+  let frontSum=0,backSum=0,frontCount=0,backCount=0;
+  for(let iz=0; iz<grid; iz++){
+    const z = raft.minZ + 0.5 + iz * stepZ;
+    for(let ix=0; ix<grid; ix++){
+      const x = raft.minX + 0.5 + ix * stepX;
+      const h = raftWaterSurface(raft.cx + x, raft.cz + z);
+      sum += h; count++;
+      const relX = x - raft.comX;
+      if(relX < 0){ leftSum += h; leftCount++; }
+      else if(relX > 0){ rightSum += h; rightCount++; }
+      else { leftSum += h; leftCount++; rightSum += h; rightCount++; }
+      const relZ = z - raft.comZ;
+      if(relZ < 0){ frontSum += h; frontCount++; }
+      else if(relZ > 0){ backSum += h; backCount++; }
+      else { frontSum += h; frontCount++; backSum += h; backCount++; }
+    }
+  }
+  return {
+    avgHeight: sum / Math.max(1,count),
+    waveDiffX: (leftSum / Math.max(1,leftCount)) - (rightSum / Math.max(1,rightCount)),
+    waveDiffZ: (frontSum / Math.max(1,frontCount)) - (backSum / Math.max(1,backCount)),
+    submergedRatio: clamp(raft.currentD / Math.max(raft.maxH, 1), 0, 1)
+  };
+}
+
 function _solveSinkage(raft){
   const maxB=raft.totalVol;
   if(raft.mass>maxB)return null;
@@ -3546,15 +3581,19 @@ function _solveSinkage(raft){
 
 function _recomputeRaft(raft){
   let mass=0,comX=0,comZ=0,cobX=0,cobZ=0,cobN=0,maxH=0;
+  let minX=Infinity,maxX=-Infinity,minZ=Infinity,maxZ=-Infinity;
   const cols=new Map();
   for(const b of raft.blocks){
     const w=RAFT_DENSITY[b.type]??RAFT_DEFAULT_DENSITY;
     mass+=w;comX+=(b.lx+0.5)*w;comZ+=(b.lz+0.5)*w;
     const ck=b.lx+','+b.lz;cols.set(ck,(cols.get(ck)||0)+1);
     maxH=Math.max(maxH,b.ly+1);
+    minX=Math.min(minX,b.lx);maxX=Math.max(maxX,b.lx);
+    minZ=Math.min(minZ,b.lz);maxZ=Math.max(maxZ,b.lz);
   }
   raft.mass=mass;raft.comX=mass>0?comX/mass:0;raft.comZ=mass>0?comZ/mass:0;
   raft.columns=cols;raft.maxH=maxH;raft.totalVol=raft.blocks.length;
+  raft.minX=minX;raft.maxX=maxX;raft.minZ=minZ;raft.maxZ=maxZ;
   for(const ck of cols.keys()){const[cx2,cz2]=ck.split(',').map(Number);cobX+=cx2+0.5;cobZ+=cz2+0.5;cobN++;}
   raft.cobX=cobN?cobX/cobN:0;raft.cobZ=cobN?cobZ/cobN:0;
   raft.sailArea=raft.blocks.filter(b=>b.type===34).length;
@@ -3665,27 +3704,35 @@ function updateRafts(dt,localWind,localGust){
 
   for(const raft of rafts){
     const isRiding=(ridingRaft===raft);
-    const surf=raftWaterSurface(raft.cx,raft.cz);
+    const waveInfo=_raftWaveInfo(raft);
+    const surf=waveInfo.avgHeight;
     const targetD=_solveSinkage(raft);
     const floorD=surf-groundH(Math.round(raft.cx),Math.round(raft.cz));
 
-    // ── Vertical (sinkage) ─────────────────────────────────────────────
+    // ── Vertical (sinkage and hydrodynamic drag) ────────────────────────
     if(targetD===null){
       raft.currentD=Math.min(floorD,raft.currentD+dt*RAFT_SINK_SPEED);
       raft.sunk=raft.currentD>=floorD-0.05;
+      raft.vy=0;
       if(!raft._sunkMsg&&raft.sunk&&isRiding){raft._sunkMsg=true;showNotif('💀 Raft overloaded — sinking!');}
     } else {
       raft.sunk=false;raft._sunkMsg=false;
-      raft.currentD+=(targetD-raft.currentD)*Math.min(1,dt*RAFT_BUOY_SPRING);
+      const desiredY=waveInfo.avgHeight-targetD;
+      const buoyancyAcc=(desiredY-raft.worldY)*RAFT_BUOY_SPRING;
+      raft.vy=(raft.vy||0)+buoyancyAcc*dt;
+      raft.vy*=Math.max(0,1-RAFT_FLUID_DRAG*waveInfo.submergedRatio*dt);
+      raft.vy=clamp(raft.vy,-RAFT_MAX_VERTICAL_SPEED,RAFT_MAX_VERTICAL_SPEED);
+      raft.currentD+=raft.vy*dt;
+      raft.currentD=Math.max(0,raft.currentD);
     }
     raft.worldY=surf-raft.currentD;
 
-    // ── Tilt (CoM vs CoB + wave micro-tilt) ───────────────────────────
+    // ── Tilt (CoM vs CoB + wave-induced torque) ─────────────────────────
     const offX=raft.comX-raft.cobX,offZ=raft.comZ-raft.cobZ;
-    const wRoll=Math.sin(totalTime*1.8+raft.cx*0.4)*0.012*(1+raft.currentD*0.5);
-    const wPitch=Math.cos(totalTime*1.5+raft.cz*0.45)*0.009*(1+raft.currentD*0.5);
-    raft.rollV +=(clamp(offX*0.55+wRoll, -RAFT_MAX_TILT,RAFT_MAX_TILT)-raft.roll)*RAFT_TILT_SPRING*dt;
-    raft.pitchV+=(clamp(offZ*0.55+wPitch,-RAFT_MAX_TILT,RAFT_MAX_TILT)-raft.pitch)*RAFT_TILT_SPRING*dt;
+    const rollTarget=clamp(offX*0.55+waveInfo.waveDiffX*RAFT_WAVE_TORQUE,-RAFT_MAX_TILT,RAFT_MAX_TILT);
+    const pitchTarget=clamp(offZ*0.55+waveInfo.waveDiffZ*RAFT_WAVE_TORQUE,-RAFT_MAX_TILT,RAFT_MAX_TILT);
+    raft.rollV +=(rollTarget-raft.roll)*RAFT_TILT_SPRING*dt;
+    raft.pitchV+=(pitchTarget-raft.pitch)*RAFT_TILT_SPRING*dt;
     raft.rollV*=Math.pow(RAFT_TILT_DECAY,dt*60);raft.pitchV*=Math.pow(RAFT_TILT_DECAY,dt*60);
     raft.roll=clamp(raft.roll+raft.rollV*dt,-RAFT_MAX_TILT,RAFT_MAX_TILT);
     raft.pitch=clamp(raft.pitch+raft.pitchV*dt,-RAFT_MAX_TILT,RAFT_MAX_TILT);
