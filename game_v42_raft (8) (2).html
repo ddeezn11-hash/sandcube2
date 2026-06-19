@@ -583,6 +583,9 @@ audio{display:none}
       <button class="esc-s" id="escAnimalSpawnBtn">🐄 Animals: ON</button>
     </div>
     <div class="esc-row2">
+      <button class="esc-s" id="escAnimalFreezeBtn">❄ Freeze Animals: OFF</button>
+    </div>
+    <div class="esc-row2">
       <button class="esc-s active" id="escWeatherBtn">🌤 Weather: ON</button>
     </div>
     <div class="esc-sg">🖥 Interface</div>
@@ -2243,7 +2246,10 @@ function generateChunk(cx,cz){
 }
 function unloadChunk(cx,cz){const key=chunkKey(cx,cz),chunk=loadedChunks.get(key);if(!chunk)return;saveChunkMods(cx,cz,chunk.mods);for(const tree of chunk.trees){const idx=TREE_PARTS.indexOf(tree);if(idx>=0)TREE_PARTS.splice(idx,1);for(const p of[...tree.trunk,...tree.roots,...tree.leaves]){treeByPos.delete(ikey(p.x,p.y,p.z))}dirtyTrees.delete(tree);treeRefreshAt.delete(tree)}for(const k of chunk.blockKeys){const e=reg.get(k);if(e!==undefined)removeFromMesh(unpackType(e),unpackIdx(e))}const wx0=cx*CHUNK_SZ,wz0=cz*CHUNK_SZ;for(let x=wx0;x<wx0+CHUNK_SZ;x++)for(let z=wz0;z<wz0+CHUNK_SZ;z++)topY.delete(topKey(x,z));for(const slot of meshes)slot.mesh.instanceMatrix.needsUpdate=true;loadedChunks.delete(key)}
 let chunkUpdateTimer=0,lastChunkPX=NaN,lastChunkPZ=NaN;
-function updateChunks(){const pcx=worldToChunk(pBody.position.x),pcz=worldToChunk(pBody.position.z);for(let dcx=-RENDER_DIST;dcx<=RENDER_DIST;dcx++)for(let dcz=-RENDER_DIST;dcz<=RENDER_DIST;dcz++){const cx=pcx+dcx,cz=pcz+dcz,key=chunkKey(cx,cz);if(!loadedChunks.has(key))loadedChunks.set(key,generateChunk(cx,cz))}const unload=[];for(const[,chunk]of loadedChunks)if(Math.abs(chunk.cx-pcx)>RENDER_DIST+1||Math.abs(chunk.cz-pcz)>RENDER_DIST+1)unload.push([chunk.cx,chunk.cz]);for(const[cx,cz]of unload)unloadChunk(cx,cz)}
+let chunkLoadQueue=[];
+function _buildChunkLoadQueue(pcx,pcz){chunkLoadQueue.length=0;for(let dcx=-RENDER_DIST;dcx<=RENDER_DIST;dcx++)for(let dcz=-RENDER_DIST;dcz<=RENDER_DIST;dcz++){const cx=pcx+dcx,cz=pcz+dcz,key=chunkKey(cx,cz);if(!loadedChunks.has(key))chunkLoadQueue.push([cx,cz,dcx*dcx+dcz*dcz])}chunkLoadQueue.sort((a,b)=>a[2]-b[2]);}
+function _processChunkLoadQueue(){if(chunkLoadQueue.length===0)return;const perFrame=_perfVeryLow?1:_perfLow?2:3;for(let i=0;i<perFrame&&chunkLoadQueue.length>0;i++){const [cx,cz]=chunkLoadQueue.shift();const key=chunkKey(cx,cz);if(!loadedChunks.has(key))loadedChunks.set(key,generateChunk(cx,cz));}}
+function updateChunks(){const pcx=worldToChunk(pBody.position.x),pcz=worldToChunk(pBody.position.z);_buildChunkLoadQueue(pcx,pcz);const unload=[];for(const[,chunk]of loadedChunks)if(Math.abs(chunk.cx-pcx)>RENDER_DIST+1||Math.abs(chunk.cz-pcz)>RENDER_DIST+1)unload.push([chunk.cx,chunk.cz]);for(const[cx,cz]of unload)unloadChunk(cx,cz)}
 
 // ─── Falling blocks ───────────────────────────────────────────────────────
 const fallingBlocks=[];
@@ -5008,6 +5014,17 @@ function updateAnimals(dt,step=1){
     }
     if(a.hitFlash>0){a.hitFlash-=dt;const fl=a.hitFlash>0?1:0;for(const child of a.mesh.children){if(child.material)child.material.emissive?.setScalar(fl*0.5)}}
     const def=ANIMAL_DEFS[a.type];
+    if(animalFreezeEnabled){
+      const cdx=pBody.position.x-a.px,cdz=pBody.position.z-a.pz,cdist=Math.sqrt(cdx*cdx+cdz*cdz);
+      if(cdist<3.5){
+        _killAnimalInstant(a,`💀 ${def.name} died instantly from your presence!`);
+        continue;
+      }
+      a.vx=0;a.vz=0;
+      const surfY=a.py+1+Math.sin(totalTime*6*def.bobAmt*20+a.px)*def.bobAmt;
+      a.mesh.position.set(a.px,surfY,a.pz);
+      continue;
+    }
     const adx=a.px-px,adz=a.pz-pz,dist2=adx*adx+adz*adz;
     if(def.aggressive){
       // ── Wolf: chase + attack player ──
@@ -5119,7 +5136,24 @@ function updateAnimals(dt,step=1){
     }
   }
 }
+function _killAnimalInstant(a,msg){
+  if(a.dead)return;
+  a.dead=true;
+  a.despawnTimer=6;
+  const def=ANIMAL_DEFS[a.type];
+  stats.animalKills++;
+  gainXP(XP_GAINS.animalKill,'🥩');
+  doCamShake(0.06,4);
+  showNotif(msg||`💀 ${def.name} killed — butcher it with F to get meat!`);
+  playBlockBreak(3);
+}
+
 function tryHitAnimal(){camera.getWorldPosition(_ro);camera.getWorldDirection(_rd);let best=null,bestD=5.5;for(const a of animals){if(a.dead)continue;const dx=a.px-_ro.x,dy=(a.py+0.5)-_ro.y,dz=a.pz-_ro.z,t2=dx*_rd.x+dy*_rd.y+dz*_rd.z;if(t2<0||t2>bestD)continue;const ex=_ro.x+_rd.x*t2-a.px,ey=_ro.y+_rd.y*t2-(a.py+0.5),ez=_ro.z+_rd.z*t2-a.pz,def=ANIMAL_DEFS[a.type];if(Math.abs(ex)<def.w&&Math.abs(ey)<def.h&&Math.abs(ez)<def.d){bestD=t2;best=a}}if(!best)return false;
+  if(animalFreezeEnabled){
+    const def=ANIMAL_DEFS[best.type];
+    _killAnimalInstant(best,`💀 ${def.name} killed instantly!`);
+    return true;
+  }
   // ── Weapon damage calculation ──
   const _heldT=inventory[selectedSlot]?.type;
   let _hitDmg=1; // bare hands / stick = 1
@@ -6511,7 +6545,7 @@ function applyFog(){scene.fog.far=FOG_OPTS[fogIdx];scene.fog.near=FOG_OPTS[fogId
 
 // New settings state
 let showParticles=true,showRainFx=true,camShakeEnabled=true,showMinimap=true,showXpBar=true;
-let autoEat=false,sprintToggle=false,animalSpawnEnabled=true;
+let autoEat=false,sprintToggle=false,animalSpawnEnabled=true,animalFreezeEnabled=false;
 let sensIdx=1;const SENS_OPTS=[0.5,1.0,1.5,2.0,3.0];const SENS_NAMES=['Slow','Normal','Fast','Very Fast','Max'];
 let diffIdx=1;const DIFF_OPTS=[0.5,1.0,2.0];const DIFF_NAMES=['Easy','Normal','Hard'];
 let brightIdx=1;const BRIGHT_VALS=[0.35,0,0];const BRIGHT_LABELS=['Dark','Normal','Bright'];
@@ -6556,6 +6590,7 @@ document.getElementById('escGodBtn').addEventListener('click',function(){godMode
 document.getElementById('escCreativeBtn').addEventListener('click',function(){creativeMode=!creativeMode;this.textContent=`🎨 Creative: ${creativeMode?'ON':'OFF'}`;if(!creativeMode)closeCreativeInv();showNotif(creativeMode?'🎨 Creative ON — press E for inventory':'Creative OFF')});
 document.getElementById('escFlyBtn').addEventListener('click',function(){flyMode=!flyMode;this.textContent=`🕊 Fly: ${flyMode?'ON':'OFF'}`;showNotif(flyMode?'🕊 Fly ON':'Fly OFF')});
 document.getElementById('escAnimalSpawnBtn').addEventListener('click',function(){animalSpawnEnabled=!animalSpawnEnabled;this.textContent=`🐄 Animals: ${animalSpawnEnabled?'ON':'OFF'}`});
+document.getElementById('escAnimalFreezeBtn').addEventListener('click',function(){animalFreezeEnabled=!animalFreezeEnabled;this.textContent=`❄ Freeze Animals: ${animalFreezeEnabled?'ON':'OFF'}`;this.classList.toggle('active',animalFreezeEnabled);showNotif(animalFreezeEnabled?'❄ Animals frozen':'❄ Animals unfrozen')});
 document.getElementById('escMinimapBtn').addEventListener('click',function(){showMinimap=!showMinimap;applyMinimap();this.textContent=`🗺 Minimap: ${showMinimap?'ON':'OFF'}`});
 // Minimap update mode cycling
 {const MM_MODES=['smart','realtime','0.25','0.5','1','2','manual'];
@@ -7473,6 +7508,7 @@ function animate(){
   // Chunk update
   chunkUpdateTimer-=dt;
   if(chunkUpdateTimer<=0||Math.abs(pBody.position.x-lastChunkPX)>8||Math.abs(pBody.position.z-lastChunkPZ)>8){updateChunks();chunkUpdateTimer=2.0;lastChunkPX=pBody.position.x;lastChunkPZ=pBody.position.z}
+  _processChunkLoadQueue();
 
   // Autosave
   autoSaveTimer+=dt;
