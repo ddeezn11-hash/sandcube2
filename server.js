@@ -13,7 +13,7 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8080
 const TICK_RATE = 60; // Server ticks per second
 const TICK_INTERVAL = 1000 / TICK_RATE;
 const HEARTBEAT_INTERVAL = 30000; // 30 seconds
